@@ -1,6 +1,5 @@
 from fastapi import FastAPI, Request, HTTPException, Query, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Optional
 import os, json
@@ -9,7 +8,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-import database as db
+from database import get_calls_collection
 from models import StatusUpdate, NotesUpdate
 from auth import auth_router, require_auth
 
@@ -17,15 +16,8 @@ limiter = Limiter(key_func=get_remote_address)
 RATE_WEBHOOK = os.getenv("RATE_LIMIT_WEBHOOK", "30/minute")
 RATE_API     = os.getenv("RATE_LIMIT_API",     "120/minute")
 
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    await db.connect()
-    yield
-    await db.disconnect()
-
-
-app = FastAPI(title="Receptionist API", version="1.0.0", lifespan=lifespan)
+# No lifespan — lazy DB connection works in both serverless and long-running
+app = FastAPI(title="Receptionist API", version="1.0.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -33,7 +25,6 @@ app.include_router(auth_router)
 
 
 def parse_args(raw) -> dict:
-    """Arguments arrive as a dict or a JSON string — normalise to dict."""
     if isinstance(raw, str):
         try:
             return json.loads(raw)
@@ -43,10 +34,6 @@ def parse_args(raw) -> dict:
 
 
 def extract_transcript(message: dict) -> list:
-    """
-    Only user + bot turns, skip system / tool_calls rows and empty messages.
-    Preserves secondsFromStart for potential future timeline UI.
-    """
     turns = []
     for m in message.get("artifact", {}).get("messages", []):
         role = m.get("role")
@@ -71,30 +58,25 @@ async def vapi_webhook(request: Request):
         if not body:
             return {"status": "empty_body"}
 
-        data    = json.loads(body)
-        message = data.get("message", {})
+        data     = json.loads(body)
+        message  = data.get("message", {})
         msg_type = message.get("type")
 
         print(f"[Webhook] type={msg_type}")
 
-        # ── tool-calls ────────────────────────────────────────────────────────
         if msg_type == "tool-calls":
-
-            # ID resolution — chat.id is the stable session identifier.
-            # For real phone calls this will be call.id instead.
+            # chat.id for web chat, call.id for phone calls
             call_id = (
-                message.get("chat",  {}).get("id")        # chat session (current)
-                or message.get("call", {}).get("id")      # phone call (future)
-                or data.get("chat",  {}).get("id")
-                or data.get("call",  {}).get("id")
+                message.get("chat", {}).get("id")
+                or message.get("call", {}).get("id")
+                or data.get("chat", {}).get("id")
+                or data.get("call", {}).get("id")
             )
 
-            # Metadata available in the payload
-            assistant_name = message.get("assistant", {}).get("name")  # "Riley"
-            caller_number  = (                                          # null for chat
+            assistant_name = message.get("assistant", {}).get("name")
+            caller_number  = (
                 message.get("call", {}).get("customer", {}).get("number")
-                or data.get("call", {}).get("customer", {}).get("number")
-                if message.get("call") or data.get("call") else None
+                if message.get("call") else None
             )
 
             for tool_call in message.get("toolCalls", []):
@@ -105,7 +87,6 @@ async def vapi_webhook(request: Request):
                 if name != "record_call_details":
                     continue
 
-                # Guaranteed non-null ID
                 resolved_id = (
                     call_id
                     or tool_call.get("id")
@@ -113,25 +94,22 @@ async def vapi_webhook(request: Request):
                 )
 
                 doc = {
-                    "call_id":        resolved_id,
-                    "received_at":    datetime.now(timezone.utc).isoformat(),
-                    # ── from tool args ───────────────────────────────────────
-                    "caller_name":    args.get("caller_name") or "Unknown",
-                    "intent":         args.get("intent") or args.get("intend") or "other",
-                    "message":        args.get("message", ""),
-                    "summary":        args.get("summary", ""),
-                    # ── from payload metadata ────────────────────────────────
-                    "agent_name":     assistant_name,
-                    "caller_number":  caller_number,
-                    "transcript":     extract_transcript(message),
-                    # ── defaults ─────────────────────────────────────────────
-                    "status":         "unread",
-                    "notes":          None,
+                    "call_id":          resolved_id,
+                    "received_at":      datetime.now(timezone.utc).isoformat(),
+                    "caller_name":      args.get("caller_name") or "Unknown",
+                    "intent":           args.get("intent") or args.get("intend") or "other",
+                    "message":          args.get("message", ""),
+                    "summary":          args.get("summary", ""),
+                    "agent_name":       assistant_name,
+                    "caller_number":    caller_number,
+                    "transcript":       extract_transcript(message),
+                    "status":           "unread",
+                    "notes":            None,
                     "duration_seconds": None,
                 }
 
-                # Upsert — duplicate webhook fires won't create dupes
-                result = await db.calls.update_one(
+                calls = await get_calls_collection()
+                result = await calls.update_one(
                     {"call_id": resolved_id},
                     {"$setOnInsert": doc},
                     upsert=True,
@@ -140,7 +118,7 @@ async def vapi_webhook(request: Request):
                 if result.upserted_id:
                     print(f"[Webhook] NEW  → {doc['caller_name']} / {doc['intent']} / {resolved_id}")
                 else:
-                    print(f"[Webhook] DUPE → {resolved_id} already exists, skipped")
+                    print(f"[Webhook] DUPE → {resolved_id} already exists")
 
                 return {
                     "results": [{
@@ -149,7 +127,6 @@ async def vapi_webhook(request: Request):
                     }]
                 }
 
-        # ── end-of-call-report: add duration when call ends ───────────────────
         elif msg_type == "end-of-call-report":
             call_id = (
                 message.get("chat", {}).get("id")
@@ -159,7 +136,8 @@ async def vapi_webhook(request: Request):
             )
             duration = message.get("durationSeconds")
             if call_id and duration is not None:
-                await db.calls.update_one(
+                calls = await get_calls_collection()
+                await calls.update_one(
                     {"call_id": call_id},
                     {"$set": {"duration_seconds": int(duration)}},
                 )
@@ -202,9 +180,10 @@ async def get_calls(
             {"caller_number": {"$regex": search, "$options": "i"}},
         ]
 
-    total  = await db.calls.count_documents(query)
+    calls  = await get_calls_collection()
+    total  = await calls.count_documents(query)
     cursor = (
-        db.calls.find(query, {"_id": 0})
+        calls.find(query, {"_id": 0})
         .sort("received_at", -1)
         .skip((page - 1) * limit)
         .limit(limit)
@@ -216,7 +195,8 @@ async def get_calls(
 @app.get("/api/calls/{call_id}")
 @limiter.limit(RATE_API)
 async def get_call(request: Request, call_id: str, _user: str = Depends(require_auth)):
-    doc = await db.calls.find_one({"call_id": call_id}, {"_id": 0})
+    calls = await get_calls_collection()
+    doc   = await calls.find_one({"call_id": call_id}, {"_id": 0})
     if not doc:
         raise HTTPException(404, "Call not found")
     return doc
@@ -229,9 +209,8 @@ async def update_status(
 ):
     if body.status not in ("unread", "read", "actioned"):
         raise HTTPException(400, "status must be unread | read | actioned")
-    res = await db.calls.update_one(
-        {"call_id": call_id}, {"$set": {"status": body.status}}
-    )
+    calls = await get_calls_collection()
+    res   = await calls.update_one({"call_id": call_id}, {"$set": {"status": body.status}})
     if res.matched_count == 0:
         raise HTTPException(404, "Call not found")
     return {"ok": True, "call_id": call_id, "status": body.status}
@@ -242,9 +221,8 @@ async def update_status(
 async def update_notes(
     request: Request, call_id: str, body: NotesUpdate, _user: str = Depends(require_auth)
 ):
-    res = await db.calls.update_one(
-        {"call_id": call_id}, {"$set": {"notes": body.notes}}
-    )
+    calls = await get_calls_collection()
+    res   = await calls.update_one({"call_id": call_id}, {"$set": {"notes": body.notes}})
     if res.matched_count == 0:
         raise HTTPException(404, "Call not found")
     return {"ok": True, "call_id": call_id}
@@ -253,7 +231,8 @@ async def update_notes(
 @app.delete("/api/calls/{call_id}")
 @limiter.limit(RATE_API)
 async def delete_call(request: Request, call_id: str, _user: str = Depends(require_auth)):
-    res = await db.calls.delete_one({"call_id": call_id})
+    calls = await get_calls_collection()
+    res   = await calls.delete_one({"call_id": call_id})
     if res.deleted_count == 0:
         raise HTTPException(404, "Call not found")
     return {"ok": True, "call_id": call_id}
@@ -265,15 +244,16 @@ async def delete_call(request: Request, call_id: str, _user: str = Depends(requi
 @app.get("/api/stats")
 @limiter.limit(RATE_API)
 async def get_stats(request: Request, _user: str = Depends(require_auth)):
-    total  = await db.calls.count_documents({})
-    unread = await db.calls.count_documents({"status": "unread"})
-    urgent = await db.calls.count_documents({"intent": "urgent"})
+    calls  = await get_calls_collection()
+    total  = await calls.count_documents({})
+    unread = await calls.count_documents({"status": "unread"})
+    urgent = await calls.count_documents({"intent": "urgent"})
     by_intent = {
-        i: await db.calls.count_documents({"intent": i})
+        i: await calls.count_documents({"intent": i})
         for i in ("work", "personal", "urgent", "spam", "other")
     }
     by_status = {
-        s: await db.calls.count_documents({"status": s})
+        s: await calls.count_documents({"status": s})
         for s in ("unread", "read", "actioned")
     }
     return {
