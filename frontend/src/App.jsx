@@ -23,6 +23,7 @@ import {
   saveAgentConfig,
 } from "./api";
 import { useToast } from "./ToastContext";
+import PhoneNumberCard from "./components/phoneNumberCard";
 
 const PhoneIcon = () => (
   <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="currentColor">
@@ -368,7 +369,6 @@ export default function App() {
       />
 
       <div className="flex-1 flex flex-col min-w-0 overflow-hidden">
-
         {/* ── Page: Agent ── */}
         {page === "agent" && agentConfig && (
           <AgentPage
@@ -396,15 +396,19 @@ export default function App() {
                     : `${filtered.length} call${filtered.length !== 1 ? "s" : ""}`}
                 </p>
               </div>
-              <button
-                onClick={handleRefresh}
-                disabled={loading}
-                className="border border-border-2 text-tx-2 hover:text-tx hover:border-white/20
-                  text-[13px] font-medium px-3 py-1.5 rounded-sm transition-colors
-                  disabled:opacity-40 disabled:cursor-not-allowed"
-              >
-                ↻ Refresh
-              </button>
+              <div className="flex gap-3">
+                <PhoneNumberCard number={import.meta.env.VITE_PHONE_NUMBER} />
+
+                <button
+                  onClick={handleRefresh}
+                  disabled={loading}
+                  className="border border-border-2 text-tx-2 hover:text-tx hover:border-white/20
+                text-[20px] font-medium px-3 py-1.5 rounded-sm transition-colors
+                disabled:opacity-40 disabled:cursor-not-allowed"
+                >
+                  ↻ Refresh
+                </button>
+              </div>
             </div>
 
             <div className="flex-1 overflow-y-auto px-8 py-7">
